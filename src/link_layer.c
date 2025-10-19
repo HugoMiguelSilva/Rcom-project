@@ -186,6 +186,37 @@ static int readSupervisionFrame(unsigned char *address, unsigned char *control)
     }
 }
 
+void sendRR0() {
+
+    unsigned char control;
+
+    control = expectedNs == 0 ? C_RR0 : C_RR1;
+
+    sendSupervisionFrame(A_TX, control);
+
+}
+
+void sendRR1() {
+
+    unsigned char next_ns = expectedNs == 0 ? 1 : 0;
+
+    unsigned char control;
+
+    control = next_ns == 0 ? C_RR0 : C_RR1;
+
+    sendSupervisionFrame(A_TX, control);
+
+}
+
+void sendREJ() {
+
+    unsigned char rej_control;
+
+    rej_control = expectedNs == 0 : C_REJ0 = C_REJ1;
+
+    sendSupervisionFrame(A_TX, rej_control);
+}
+
 ////////////////////////////////////////////////
 // LLOPEN
 ////////////////////////////////////////////////
@@ -258,49 +289,165 @@ int llopen(LinkLayer connectionParameters)
 ////////////////////////////////////////////////
 // LLWRITE
 ////////////////////////////////////////////////
-static unsigned char sequenceNumber = 0; // Ns
+static unsigned char sequenceNumber = 0; // Ns (Tx)
 
 int llwrite(const unsigned char *buf, int bufSize)
 {
     unsigned char frame[MAX_FRAME_SIZE];
     int frameSize = 0;
 
+    // * builds Information frame Ns (Ns=0 or 1) 
     unsigned char A = A_TX;
     unsigned char C = (sequenceNumber == 0) ? C_I0 : C_I1;
 
     frame[frameSize++] = FLAG;
     frame[frameSize++] = A;
     frame[frameSize++] = C;
-    frame[frameSize++] = calcBCC1(A, C);
 
+    // * implements error detection (compute BCC over the data packet)
+    frame[frameSize++] = calcBCC1(A, C);
     // Add BCC2 to payload before stuffing
     unsigned char temp[MAX_PAYLOAD_SIZE];
     memcpy(temp, buf, bufSize);
     temp[bufSize] = calcBCC2(buf, bufSize);
 
+    // * parses data packet to implement byte stuffing (transparency)
     unsigned char stuffed[STUFFED_BUFFER_SIZE];
     int stuffedSize = bytestuffing(temp, bufSize + 1, stuffed,STUFFED_BUFFER_SIZE);
     if (stuffedSize < 0) return -1;
 
     memcpy(&frame[frameSize], stuffed, stuffedSize);
     frameSize += stuffedSize;
-
     frame[frameSize++] = FLAG;
 
-    if (writeBytesSerialPort(frame, frameSize) < 0)
-    {
-        perror("[llwrite] Error sending frame");
-        return -1;
-    }
+    
+    alarmEnabled = 0;
+    alarmCount = 0;
+    
+    struct sigaction sa;
+    sa.sa_handler = alarmHandler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGALRM, &sa, NULL);
+    
+    unsigned char byte;
+    unsigned char buffer[MAX_FRAME_SIZE];
+    int state = 0;
+    int idx = 0;
+    
+    
+    while(alarmCount < connection.nRetransmissions) {
+        
+        // * sends I frame 
+        if (writeBytesSerialPort(frame, frameSize) < 0)
+        {
+            perror("[llwrite] Error sending frame");
+            return -1;
+        }
+        
+        alarmEnabled = 1;
+        alarm(connection.timeout);
+        
+        // * reads one byte at a time to receive response
+        while(alarmEnabled) {
 
-    printf("[llwrite] Sent I frame (Ns=%d, stuffed size=%d)\n", sequenceNumber, frameSize);
-    sequenceNumber ^= 1;
-    return bufSize;
+            if(readByteSerialPort(&byte) == 1) {
+
+                switch (state)
+                {
+                    case 0:
+                        if (byte == FLAG) { state = 1; idx = 0; }
+                        break;
+
+                    case 1:
+                        if (byte == FLAG) break;
+                        if (byte != A_TX) { state = 0; idx = 0; break; }
+                        buffer[idx++] = byte;
+                        state = 2;
+                        break;
+
+                    case 2:
+                        if (byte == FLAG) { state = 1; idx = 0; break; }
+                        if (byte != C_I0 && byte != C_I1) { state = 0; idx = 0; break; }
+                        buffer[idx++] = byte;
+                        state = 3;
+                        break;
+
+                    case 3:
+                        if (byte == FLAG) { state = 1; idx = 0; break; }
+                        buffer[idx++] = byte;
+                        state = 4;
+                        break;
+
+                    case 4:
+                        if (byte == FLAG)
+                        {
+                            unsigned char received_A = buffer[0];
+                            unsigned char received_C = buffer[1];
+                            unsigned char BCC1 = buffer[2];
+
+                            if (!isValidBCC1(received_A, received_C, BCC1))
+                            {
+                                state = 0;
+                                idx = 0;
+                                break;
+                            }
+
+                            int expected_rr = (sequenceNumber == 0) ? C_RR1 : C_RR0;
+                            int expected_rej = (sequenceNumber == 0) ? C_REJ0 : C_REJ1;
+
+                            // * if negative response (REJ) or no response, resends I frame up to a maximum number of times (retransmission mechanism explained in slide 46)
+
+                            if(received_C == expected_rr) 
+                            {
+
+                                // * return success
+
+                                alarm(0);
+                                sequenceNumber ^= 1;
+                                printf("[llwrite] Sent I frame (Ns=%d, stuffed size=%d)\n", sequenceNumber, frameSize);
+                                return bufSize;
+
+                            } 
+                            else if (received_C = expected_rej)
+                            {
+                                alarm(0);
+                                alarmCount++;
+                                break;
+                            }
+                            else
+                            {
+                                state = 0;
+                                idx = 0;
+                            } 
+
+                            state = 0; idx = 0;
+                            break;
+                        }
+                        else
+                        {
+                            buffer[idx++] = byte;
+                        }
+                        break;
+                }
+
+            }
+
+        }
+
+
+        // * return failure 
+
+        printf("[llwrite] Tx - Timeout");
+        return bufSize;
+    }
 }
 
 ////////////////////////////////////////////////
 // LLREAD
 ////////////////////////////////////////////////
+static int expectedNs = 0; // Ns (Rx)
+
 int llread(unsigned char *packet)
 {
     unsigned char byte;
@@ -364,34 +511,79 @@ int llread(unsigned char *packet)
 
                     if (!isValidBCC1(A, C, BCC1))
                     {
+
+                        // * ignore or send RR(Ns) 
+
+                        sendRR0();
+
                         printf("[llread] Invalid BCC1\n");
                         state = 0; idx = 0;
                         break;
+                    } 
+
+                    else {
+
+                        unsigned char receivedNs = C == C_I1 ? 1 : 0;
+
+                        // * if expected Ns (new frame, no duplicate) {
+
+                        if(expectedNs == receivedNs) {
+
+                            // parse frane to implement byte de-stuffing
+
+                            unsigned char destuffed[STUFFED_BUFFER_SIZE];
+                            int destuffedSize = destuff(stuffedData, stuffedPayloadSize, destuffed, STUFFED_BUFFER_SIZE);
+                            if (destuffedSize < 0)
+                            {
+                                printf("[llread] Destuff failed\n");
+                                state = 0; idx = 0;
+                                break;
+                            }
+        
+                            int payloadSize = destuffedSize - 1;
+                            unsigned char received_bcc2 = destuffed[destuffedSize - 1];
+
+                            // compute BCC2 over the data 
+
+                            unsigned char calc_bcc2 = calcBCC2(destuffed, payloadSize);
+        
+                            if (calc_bcc2 != received_bcc2)
+                            {
+
+                                // * send REJ(Ns)
+
+                                sendREJ();
+                                printf("[llread] Invalid BCC2\n");
+                                state = 0; idx = 0;
+                                break;
+                            } else {
+
+                                // * reply “send me new frame” by sending RR(Ns+1)
+                                sendRR1();
+                                // * return data packet 
+
+                                // update 
+                                expectedNs = expectedNs == 0 ? 1 : 0;
+
+                                memcpy(packet, destuffed, payloadSize);
+                                printf("[llread] Frame OK, payload = %d bytes\n", payloadSize);
+                                return payloadSize;
+
+                            }
+
+                        } else {
+
+                            // TODO:  ignore or send RR(Ns) 
+
+                            sendRR0();
+                            printf("[llread] Not expected Ns, duplicate");
+                            state = 0; idx = 0;
+                            break;
+
+                        }
+
                     }
 
-                    unsigned char destuffed[STUFFED_BUFFER_SIZE];
-                    int destuffedSize = destuff(stuffedData, stuffedPayloadSize, destuffed, STUFFED_BUFFER_SIZE);
-                    if (destuffedSize < 0)
-                    {
-                        printf("[llread] Destuff failed\n");
-                        state = 0; idx = 0;
-                        break;
-                    }
-
-                    int payloadSize = destuffedSize - 1;
-                    unsigned char received_bcc2 = destuffed[destuffedSize - 1];
-                    unsigned char calc_bcc2 = calcBCC2(destuffed, payloadSize);
-
-                    if (calc_bcc2 != received_bcc2)
-                    {
-                        printf("[llread] Invalid BCC2\n");
-                        state = 0; idx = 0;
-                        break;
-                    }
-
-                    memcpy(packet, destuffed, payloadSize);
-                    printf("[llread] Frame OK, payload = %d bytes\n", payloadSize);
-                    return payloadSize;
                 }
                 else
                 {
