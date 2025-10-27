@@ -17,7 +17,6 @@
 #include <time.h>
 #include <unistd.h>
 
-
 #define TXDEV "/dev/ttyS10"
 #define RXDEV "/dev/ttyS11"
 #define TX_EMULATOR "/dev/emulatorTx"
