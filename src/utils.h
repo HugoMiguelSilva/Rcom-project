@@ -32,10 +32,22 @@
 #define C_REJ0 0x01
 #define C_REJ1 0x81
 
-
-
 // Max frame size
 #define MAX_FRAME_SIZE 2048
+
+// Control Packet 
+#define C_START 1
+#define C_END 3
+#define T_SIZE 0
+#define T_NAME 1
+
+// Data Packet
+#define C_DATA 2
+
+// Max data packet size
+#define MAX_DATA_PACKET_SIZE 65535
+
+#define SIZE_FIELD_LENGTH 4
 
 // === Helper Functions ===
 unsigned char calcBCC1(unsigned char A, unsigned char C);

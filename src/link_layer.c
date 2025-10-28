@@ -1,4 +1,3 @@
-// Link layer protocol implementation
 
 #include "link_layer.h"
 #include "serial_port.h"
@@ -14,9 +13,9 @@
 static LinkLayer connection;
 static int alarmEnabled = 0;
 static int alarmCount = 0;
+static int expectedNs = 0;
+static unsigned char sequenceNumber = 0; // Ns
 
-
-// MISC
 #define _POSIX_SOURCE 1 // POSIX compliant source
 
 ////////////////////////////////////////////////
@@ -38,7 +37,6 @@ int bytestuffing(const unsigned char *data, size_t length, unsigned char *out, i
     {
         unsigned char byte = data[i];
 
-        // Leave space for two bytes if escaping
         if (outidx >= outMax - 1)
         {
             fprintf(stderr, "[bytestuffing] out of space\n");
@@ -94,7 +92,7 @@ int destuff(const unsigned char *data, size_t length, unsigned char *out, int ou
 }
 
 ////////////////////////////////////////////////
-// Helper: send supervision frame (SET, UA, DISC)
+// Helper: send supervision frame (SET, UA, DISC, RR, REJ)
 ////////////////////////////////////////////////
 static void sendSupervisionFrame(unsigned char address, unsigned char control)
 {
@@ -109,7 +107,24 @@ static void sendSupervisionFrame(unsigned char address, unsigned char control)
 }
 
 ////////////////////////////////////////////////
-// Helper: read supervision frame (blocking)
+// Simple helpers to send RR and REJ frames
+////////////////////////////////////////////////
+static void sendRR(int expectedNs)
+{
+    unsigned char control = (expectedNs == 0) ? C_RR0 : C_RR1;
+    sendSupervisionFrame(A_RX, control);
+    printf("[llread] Sent RR(%d)\n", expectedNs);
+}
+
+static void sendREJ(int expectedNs)
+{
+    unsigned char control = (expectedNs == 0) ? C_REJ0 : C_REJ1;
+    sendSupervisionFrame(A_RX, control);
+    printf("[llread] Sent REJ(%d)\n", expectedNs);
+}
+
+////////////////////////////////////////////////
+// Read a supervision frame (UA, RR, REJ, etc.)
 ////////////////////////////////////////////////
 static int readSupervisionFrame(unsigned char *address, unsigned char *control)
 {
@@ -129,24 +144,15 @@ static int readSupervisionFrame(unsigned char *address, unsigned char *control)
                 break;
 
             case 1:
-                if (byte == FLAG) break; // ignore duplicate flag
+                if (byte == FLAG) break;
                 buffer[idx++] = byte; // A
-                if (byte != A_TX && byte != A_RX) {
-                    state = 0;
-                    idx = 0;
-                    break;
-                }
+                if (byte != A_TX && byte != A_RX) { state = 0; idx = 0; break; }
                 state = 2;
                 break;
 
             case 2:
                 if (byte == FLAG) { state = 1; idx = 0; break; }
                 buffer[idx++] = byte; // C
-                if (byte != C_SET && byte != C_UA && byte != C_DISC) {
-                    state = 0;
-                    idx = 0;
-                    break;
-                }
                 state = 3;
                 break;
 
@@ -162,59 +168,19 @@ static int readSupervisionFrame(unsigned char *address, unsigned char *control)
                     unsigned char A = buffer[0];
                     unsigned char C = buffer[1];
                     unsigned char BCC = buffer[2];
-
                     if (isValidBCC1(A, C, BCC))
                     {
                         *address = A;
                         *control = C;
                         return 0;
                     }
-                    else
-                    {
-                        state = 0;
-                        idx = 0;
-                    }
+                    else { state = 0; idx = 0; }
                 }
-                else
-                {
-                    state = 0;
-                    idx = 0;
-                }
+                else { state = 0; idx = 0; }
                 break;
             }
         }
     }
-}
-
-void sendRR0() {
-
-    unsigned char control;
-
-    control = expectedNs == 0 ? C_RR0 : C_RR1;
-
-    sendSupervisionFrame(A_TX, control);
-
-}
-
-void sendRR1() {
-
-    unsigned char next_ns = expectedNs == 0 ? 1 : 0;
-
-    unsigned char control;
-
-    control = next_ns == 0 ? C_RR0 : C_RR1;
-
-    sendSupervisionFrame(A_TX, control);
-
-}
-
-void sendREJ() {
-
-    unsigned char rej_control;
-
-    rej_control = expectedNs == 0 : C_REJ0 = C_REJ1;
-
-    sendSupervisionFrame(A_TX, rej_control);
 }
 
 ////////////////////////////////////////////////
@@ -257,6 +223,7 @@ int llopen(LinkLayer connectionParameters)
                     address == A_RX && control == C_UA)
                 {
                     alarm(0);
+                    sequenceNumber = 0; 
                     printf("[llopen - TX] UA received\n");
                     return 0;
                 }
@@ -280,6 +247,7 @@ int llopen(LinkLayer connectionParameters)
                 printf("[llopen - RX] SET received\n");
                 sendSupervisionFrame(A_RX, C_UA);
                 printf("[llopen - RX] UA sent\n");
+                expectedNs = 0;
                 return 0;
             }
         }
@@ -287,166 +255,102 @@ int llopen(LinkLayer connectionParameters)
 }
 
 ////////////////////////////////////////////////
-// LLWRITE
+// LLWRITE  (Stop-and-Wait implemented)
 ////////////////////////////////////////////////
-static unsigned char sequenceNumber = 0; // Ns (Tx)
+
 
 int llwrite(const unsigned char *buf, int bufSize)
 {
     unsigned char frame[MAX_FRAME_SIZE];
     int frameSize = 0;
 
-    // * builds Information frame Ns (Ns=0 or 1) 
     unsigned char A = A_TX;
     unsigned char C = (sequenceNumber == 0) ? C_I0 : C_I1;
 
     frame[frameSize++] = FLAG;
     frame[frameSize++] = A;
     frame[frameSize++] = C;
-
-    // * implements error detection (compute BCC over the data packet)
     frame[frameSize++] = calcBCC1(A, C);
-    // Add BCC2 to payload before stuffing
+
+    // Append BCC2 before stuffing
     unsigned char temp[MAX_PAYLOAD_SIZE];
     memcpy(temp, buf, bufSize);
     temp[bufSize] = calcBCC2(buf, bufSize);
 
-    // * parses data packet to implement byte stuffing (transparency)
     unsigned char stuffed[STUFFED_BUFFER_SIZE];
-    int stuffedSize = bytestuffing(temp, bufSize + 1, stuffed,STUFFED_BUFFER_SIZE);
+    int stuffedSize = bytestuffing(temp, bufSize + 1, stuffed, STUFFED_BUFFER_SIZE);
     if (stuffedSize < 0) return -1;
 
     memcpy(&frame[frameSize], stuffed, stuffedSize);
     frameSize += stuffedSize;
     frame[frameSize++] = FLAG;
 
-    
-    alarmEnabled = 0;
+    // Stop-and-Wait: send and wait for RR/REJ
     alarmCount = 0;
-    
-    struct sigaction sa;
-    sa.sa_handler = alarmHandler;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = 0;
-    sigaction(SIGALRM, &sa, NULL);
-    
-    unsigned char byte;
-    unsigned char buffer[MAX_FRAME_SIZE];
-    int state = 0;
-    int idx = 0;
-    
-    
-    while(alarmCount < connection.nRetransmissions) {
-        
-        // * sends I frame 
-        if (writeBytesSerialPort(frame, frameSize) < 0)
-        {
-            perror("[llwrite] Error sending frame");
+
+    while (alarmCount < connection.nRetransmissions)
+    {
+        if (writeBytesSerialPort(frame, frameSize) < 0) {
+            perror("[llwrite] Write failed");
             return -1;
         }
+        printf("[llwrite] Sent I frame Ns=%d (%d bytes)\n", sequenceNumber, frameSize);
         
         alarmEnabled = 1;
         alarm(connection.timeout);
         
-        // * reads one byte at a time to receive response
-        while(alarmEnabled) {
-
-            if(readByteSerialPort(&byte) == 1) {
-
-                switch (state)
+        unsigned char addr, ctrl;
+        
+        while (alarmEnabled)
+        {
+            if (readSupervisionFrame(&addr, &ctrl) == 0)
+            {
+                printf("readSupervisionFrame(&addr, &ctrl) == 0\n"); 
+                int expected_rr = (sequenceNumber == 0) ? C_RR1 : C_RR0;
+                int expected_rej = (sequenceNumber == 0) ? C_REJ0 : C_REJ1;
+                
+                if (ctrl == expected_rr)
                 {
-                    case 0:
-                        if (byte == FLAG) { state = 1; idx = 0; }
-                        break;
-
-                    case 1:
-                        if (byte == FLAG) break;
-                        if (byte != A_TX) { state = 0; idx = 0; break; }
-                        buffer[idx++] = byte;
-                        state = 2;
-                        break;
-
-                    case 2:
-                        if (byte == FLAG) { state = 1; idx = 0; break; }
-                        if (byte != C_I0 && byte != C_I1) { state = 0; idx = 0; break; }
-                        buffer[idx++] = byte;
-                        state = 3;
-                        break;
-
-                    case 3:
-                        if (byte == FLAG) { state = 1; idx = 0; break; }
-                        buffer[idx++] = byte;
-                        state = 4;
-                        break;
-
-                    case 4:
-                        if (byte == FLAG)
-                        {
-                            unsigned char received_A = buffer[0];
-                            unsigned char received_C = buffer[1];
-                            unsigned char BCC1 = buffer[2];
-
-                            if (!isValidBCC1(received_A, received_C, BCC1))
-                            {
-                                state = 0;
-                                idx = 0;
-                                break;
-                            }
-
-                            int expected_rr = (sequenceNumber == 0) ? C_RR1 : C_RR0;
-                            int expected_rej = (sequenceNumber == 0) ? C_REJ0 : C_REJ1;
-
-                            // * if negative response (REJ) or no response, resends I frame up to a maximum number of times (retransmission mechanism explained in slide 46)
-
-                            if(received_C == expected_rr) 
-                            {
-
-                                // * return success
-
-                                alarm(0);
-                                sequenceNumber ^= 1;
-                                printf("[llwrite] Sent I frame (Ns=%d, stuffed size=%d)\n", sequenceNumber, frameSize);
-                                return bufSize;
-
-                            } 
-                            else if (received_C = expected_rej)
-                            {
-                                alarm(0);
-                                alarmCount++;
-                                break;
-                            }
-                            else
-                            {
-                                state = 0;
-                                idx = 0;
-                            } 
-
-                            state = 0; idx = 0;
-                            break;
-                        }
-                        else
-                        {
-                            buffer[idx++] = byte;
-                        }
-                        break;
+                    alarm(0);
+                    printf("[llwrite] RR received -> frame accepted\n");
+                    sequenceNumber ^= 1; // toggle Ns
+                    return bufSize;
                 }
-
+                else if (ctrl == expected_rej)
+                {
+                    alarm(0);
+                    printf("[llwrite] REJ received -> retransmit\n");
+                    break; // retry loop
+                }
+                else printf("[llwrite] Unexpected frame: A=0x%02X C=0x%02X\n", addr, ctrl);
+                
             }
-
         }
-
-
-        // * return failure 
-
-        printf("[llwrite] Tx - Timeout");
-        return bufSize;
+        
+        alarmCount++;
+        printf("[llwrite] Timeout/retry %d/%d\n", alarmCount, connection.nRetransmissions);
     }
+
+
+    printf("[llwrite] Transmission failed after retries\n"); //perguntar ao stor sobre isto nao deve estar correto mas funciona
+
+    unsigned char give_up_frame[5];
+    give_up_frame[0] = FLAG;
+    give_up_frame[1] = A_TX;
+    give_up_frame[2] = C_DISC; 
+    give_up_frame[3] = calcBCC1(A_TX, C_DISC);
+    give_up_frame[4] = FLAG;
+    
+    writeBytesSerialPort(give_up_frame, 5);
+
+
+    return -1;
 }
 
 ////////////////////////////////////////////////
-// LLREAD
+// LLREAD (Receiver side, sends RR/REJ)
 ////////////////////////////////////////////////
-static int expectedNs = 0; // Ns (Rx)
+
 
 int llread(unsigned char *packet)
 {
@@ -454,6 +358,7 @@ int llread(unsigned char *packet)
     unsigned char buffer[MAX_FRAME_SIZE];
     int state = 0;
     int idx = 0;
+
 
     while (1)
     {
@@ -474,6 +379,12 @@ int llread(unsigned char *packet)
 
             case 2:
                 if (byte == FLAG) { state = 1; idx = 0; break; }
+
+                if (byte == C_DISC) {
+                    printf("[llread] DISC frame received while waiting for data\n");
+                    return -2; 
+                }
+
                 if (byte != C_I0 && byte != C_I1) { state = 0; idx = 0; break; }
                 buffer[idx++] = byte;
                 state = 3;
@@ -486,104 +397,63 @@ int llread(unsigned char *packet)
                 break;
 
             case 4:
-                if (byte == FLAG) { state = 0; idx = 0; break; }
-                buffer[idx++] = byte;
-                state = 5;
-                break;
-
-            case 5:
                 if (byte == FLAG)
                 {
-                    int totalSize = idx;
-                    int stuffedPayloadSize = totalSize - 3; // A,C,BCC1 removed
-
-                    if (stuffedPayloadSize <= 0)
-                    {
-                        printf("[llread] Frame too short\n");
-                        state = 0; idx = 0;
-                        break;
-                    }
-
                     unsigned char A = buffer[0];
                     unsigned char C = buffer[1];
                     unsigned char BCC1 = buffer[2];
                     unsigned char *stuffedData = &buffer[3];
+                    int stuffedPayloadSize = idx - 3;
 
                     if (!isValidBCC1(A, C, BCC1))
                     {
-
-                        // * ignore or send RR(Ns) 
-
-                        sendRR0();
-
-                        printf("[llread] Invalid BCC1\n");
+                        printf("[llread] Invalid BCC1 -> REJ(%d)\n", expectedNs);
+                        sendREJ(expectedNs);
                         state = 0; idx = 0;
                         break;
-                    } 
-
-                    else {
-
-                        unsigned char receivedNs = C == C_I1 ? 1 : 0;
-
-                        // * if expected Ns (new frame, no duplicate) {
-
-                        if(expectedNs == receivedNs) {
-
-                            // parse frane to implement byte de-stuffing
-
-                            unsigned char destuffed[STUFFED_BUFFER_SIZE];
-                            int destuffedSize = destuff(stuffedData, stuffedPayloadSize, destuffed, STUFFED_BUFFER_SIZE);
-                            if (destuffedSize < 0)
-                            {
-                                printf("[llread] Destuff failed\n");
-                                state = 0; idx = 0;
-                                break;
-                            }
-        
-                            int payloadSize = destuffedSize - 1;
-                            unsigned char received_bcc2 = destuffed[destuffedSize - 1];
-
-                            // compute BCC2 over the data 
-
-                            unsigned char calc_bcc2 = calcBCC2(destuffed, payloadSize);
-        
-                            if (calc_bcc2 != received_bcc2)
-                            {
-
-                                // * send REJ(Ns)
-
-                                sendREJ();
-                                printf("[llread] Invalid BCC2\n");
-                                state = 0; idx = 0;
-                                break;
-                            } else {
-
-                                // * reply “send me new frame” by sending RR(Ns+1)
-                                sendRR1();
-                                // * return data packet 
-
-                                // update 
-                                expectedNs = expectedNs == 0 ? 1 : 0;
-
-                                memcpy(packet, destuffed, payloadSize);
-                                printf("[llread] Frame OK, payload = %d bytes\n", payloadSize);
-                                return payloadSize;
-
-                            }
-
-                        } else {
-
-                            // TODO:  ignore or send RR(Ns) 
-
-                            sendRR0();
-                            printf("[llread] Not expected Ns, duplicate");
-                            state = 0; idx = 0;
-                            break;
-
-                        }
-
                     }
 
+                    unsigned char receivedNs = (C == C_I1) ? 1 : 0;
+
+                    unsigned char destuffed[STUFFED_BUFFER_SIZE];
+                    int destuffedSize = destuff(stuffedData, stuffedPayloadSize, destuffed, STUFFED_BUFFER_SIZE);
+                    if (destuffedSize < 0)
+                    {
+                        printf("[llread] Destuff failed -> REJ(%d)\n", expectedNs);
+                        sendREJ(expectedNs);
+                        state = 0; idx = 0;
+                        break;
+                    }
+
+                    int payloadSize = destuffedSize - 1;
+                    unsigned char received_bcc2 = destuffed[destuffedSize - 1];
+                    
+                    unsigned char calc_bcc2 = calcBCC2(destuffed, payloadSize);
+
+                    if (calc_bcc2 != received_bcc2)
+                    {
+                        printf("[llread] Invalid BCC2 -> REJ(%d)\n", expectedNs);
+                        sendREJ(expectedNs);
+                        state = 0; idx = 0;
+                        break;
+                    }
+                    printf("[llread] Received frame Ns=%d, expected Ns=%d\n", receivedNs, expectedNs);
+
+                    if (receivedNs == expectedNs)
+                    {
+                        memcpy(packet, destuffed, payloadSize);
+                        printf("[llread] Frame OK (Ns=%d), sending RR(%d)\n", receivedNs, (expectedNs ^ 1));
+                        expectedNs ^= 1;
+                        sendRR(expectedNs);
+                        printf("[llread] RR(%d) sent successfully\n", expectedNs);
+                        return payloadSize;
+                    }
+                    else
+                    {
+                        printf("[llread] Duplicate frame, resend RR(%d)\n", expectedNs);
+                        sendRR(expectedNs);
+                        state = 0; idx = 0;
+                    }
                 }
                 else
                 {
