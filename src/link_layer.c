@@ -180,6 +180,7 @@ static int readSupervisionFrame(unsigned char *address, unsigned char *control)
                 break;
             }
         }
+        else return -1;     
     }
 }
 
@@ -327,21 +328,12 @@ int llwrite(const unsigned char *buf, int bufSize)
             }
         }
         
-        alarmCount++;
+
         printf("[llwrite] Timeout/retry %d/%d\n", alarmCount, connection.nRetransmissions);
     }
 
 
-    printf("[llwrite] Transmission failed after retries\n"); //perguntar ao stor sobre isto nao deve estar correto mas funciona
-
-    unsigned char give_up_frame[5];
-    give_up_frame[0] = FLAG;
-    give_up_frame[1] = A_TX;
-    give_up_frame[2] = C_DISC; 
-    give_up_frame[3] = calcBCC1(A_TX, C_DISC);
-    give_up_frame[4] = FLAG;
-    
-    writeBytesSerialPort(give_up_frame, 5);
+    printf("[llwrite] Transmission failed after retries\n");
 
 
     return -1;
@@ -379,11 +371,6 @@ int llread(unsigned char *packet)
 
             case 2:
                 if (byte == FLAG) { state = 1; idx = 0; break; }
-
-                if (byte == C_DISC) {
-                    printf("[llread] DISC frame received while waiting for data\n");
-                    return -2; 
-                }
 
                 if (byte != C_I0 && byte != C_I1) { state = 0; idx = 0; break; }
                 buffer[idx++] = byte;
