@@ -320,6 +320,7 @@ int llwrite(const unsigned char *buf, int bufSize)
                 else if (ctrl == expected_rej)
                 {
                     alarm(0);
+                    alarmCount++;
                     printf("[llwrite] REJ received -> retransmit\n");
                     break; // retry loop
                 }
